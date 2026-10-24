@@ -788,6 +788,20 @@ When `TELEGRAM_ALLOWED_CHAT_IDS` is set:
 
 If `TELEGRAM_ALLOWED_CHAT_IDS` is unset or empty, the server operates in unrestricted mode (default), preserving 100% backward compatibility.
 
+### Write allowlist
+
+`TELEGRAM_WRITE_ALLOWED_CHAT_IDS` takes the same format and narrows only the chats that write tools may send to or change; reads still follow `TELEGRAM_ALLOWED_CHAT_IDS` alone. For example, read every chat but send only to BotFather:
+
+```env
+TELEGRAM_WRITE_ALLOWED_CHAT_IDS=@BotFather,93372553
+```
+
+- It checks the chat parameters (`chat_id`, `to_chat_id`, `channel`, `contact_id`, `group_id`) of every tool not annotated `readOnlyHint=True`. Out of scope: `from_chat_id`, the chat `forward_message`/`forward_messages` only read from, and tools that only change this account's own view of a chat: `download_media`, `add_chat_to_folder`, `remove_chat_from_folder`, `mute_chat`, `unmute_chat`, `archive_chat`, `unarchive_chat`, `save_draft`, `clear_draft`.
+- A blocked call returns `Writing to chat '<chat_id>' is restricted by privacy policy (TELEGRAM_WRITE_ALLOWED_CHAT_IDS)`.
+- When both variables are set, a write must pass both.
+- A username argument is matched after resolution, but a numeric one is compared as given: list both the username and the ID to accept either.
+- Write tools without a chat parameter (`create_group`, `join_chat_by_link`, `add_contact`, …) are not covered; hide them with `TELEGRAM_EXPOSED_TOOLS`.
+
 ## Docker
 
 Build the image:

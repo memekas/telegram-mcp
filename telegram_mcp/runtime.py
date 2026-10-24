@@ -1153,6 +1153,23 @@ ALLOWED_CHAT_IDS: Optional[set[Union[int, str]]] = None
 CHAT_PARAM_NAMES: frozenset[str] = frozenset(
     {"chat_id", "from_chat_id", "to_chat_id", "channel", "contact_id", "group_id"}
 )
+# Chat parameters a write tool only reads from: forwarding reads from_chat_id, writes to_chat_id.
+CHAT_READ_PARAM_NAMES: frozenset[str] = frozenset({"from_chat_id"})
+# Write tools whose chat parameter only picks a chat for this account's own view: nothing
+# is sent to the chat or changed in it, so TELEGRAM_WRITE_ALLOWED_CHAT_IDS does not apply.
+CHAT_WRITE_EXEMPT_TOOLS: frozenset[str] = frozenset(
+    {
+        "download_media",
+        "add_chat_to_folder",
+        "remove_chat_from_folder",
+        "mute_chat",
+        "unmute_chat",
+        "archive_chat",
+        "unarchive_chat",
+        "save_draft",
+        "clear_draft",
+    }
+)
 
 
 def _parse_allowed_chat_ids(
@@ -1229,12 +1246,41 @@ def is_chat_allowlist_enabled() -> bool:
     return get_effective_allowed_chat_ids() is not None
 
 
+def get_effective_write_allowed_chat_ids() -> Optional[set[Union[int, str]]]:
+    """Return the chats write tools may target, or None if writes are not narrowed further."""
+    return _parse_allowed_chat_ids(os.getenv("TELEGRAM_WRITE_ALLOWED_CHAT_IDS"))
+
+
+def is_chat_write_allowlist_enabled() -> bool:
+    """Return True if TELEGRAM_WRITE_ALLOWED_CHAT_IDS narrows the chats write tools may target."""
+    return get_effective_write_allowed_chat_ids() is not None
+
+
+def _writes_to_chat(tool_name: str, param_name: str) -> bool:
+    """Whether ``param_name`` of ``tool_name`` names a chat the tool sends to or changes."""
+    if param_name in CHAT_READ_PARAM_NAMES or tool_name in CHAT_WRITE_EXEMPT_TOOLS:
+        return False
+    tool = mcp._tool_manager.get_tool(tool_name)
+    # A tool the manager does not know counts as a write, so it cannot slip past.
+    return not getattr(getattr(tool, "annotations", None), "readOnlyHint", False)
+
+
 def is_chat_allowed(chat_identifier: Any, entity: Any = None) -> bool:
     """Check whether a chat identifier or entity is permitted by the allowlist.
 
     If allowlist is not enabled, always returns True.
     """
-    allowed = get_effective_allowed_chat_ids()
+    return _chat_matches(get_effective_allowed_chat_ids(), chat_identifier, entity)
+
+
+def is_chat_write_allowed(chat_identifier: Any, entity: Any = None) -> bool:
+    """Check whether write tools may target a chat; True when no write allowlist is set."""
+    return _chat_matches(get_effective_write_allowed_chat_ids(), chat_identifier, entity)
+
+
+def _chat_matches(
+    allowed: Optional[set[Union[int, str]]], chat_identifier: Any, entity: Any
+) -> bool:
     if allowed is None:
         return True
 
@@ -1277,6 +1323,16 @@ def check_chat_access(chat_identifier: Any, entity: Any = None) -> Optional[str]
         return (
             f"Access to chat '{chat_identifier}' is restricted by privacy policy "
             "(TELEGRAM_ALLOWED_CHAT_IDS)."
+        )
+    return None
+
+
+def check_chat_write_access(chat_identifier: Any, entity: Any = None) -> Optional[str]:
+    """Return an error message if writing to the chat is restricted, or None if allowed."""
+    if not is_chat_write_allowed(chat_identifier, entity):
+        return (
+            f"Writing to chat '{chat_identifier}' is restricted by privacy policy "
+            "(TELEGRAM_WRITE_ALLOWED_CHAT_IDS)."
         )
     return None
 
@@ -1523,25 +1579,31 @@ def validate_id(*param_names_to_validate, raise_errors=False):
                     kwargs[param_name] = validated_value
 
                 # Per-chat privacy allowlist enforcement
-                if is_chat_allowlist_enabled() and param_name in CHAT_PARAM_NAMES:
-                    check_target = kwargs[param_name]
-                    target_items = (
-                        check_target if isinstance(check_target, list) else [check_target]
-                    )
+                guards = []
+                if param_name in CHAT_PARAM_NAMES:
+                    if is_chat_allowlist_enabled():
+                        guards.append((is_chat_allowed, check_chat_access))
+                    if is_chat_write_allowlist_enabled() and _writes_to_chat(
+                        func.__name__, param_name
+                    ):
+                        guards.append((is_chat_write_allowed, check_chat_write_access))
+                check_target = kwargs[param_name]
+                target_items = check_target if isinstance(check_target, list) else [check_target]
+                for allowed, access_error in guards:
                     for item in target_items:
-                        if not is_chat_allowed(item):
+                        if not allowed(item):
                             resolved_allowed = False
                             if isinstance(item, str):
                                 try:
                                     cl = get_client(kwargs.get("account"))
                                     if cl:
                                         ent = await resolve_entity(item, cl)
-                                        if is_chat_allowed(item, ent):
+                                        if allowed(item, ent):
                                             resolved_allowed = True
                                 except Exception:
                                     pass
                             if not resolved_allowed:
-                                err = check_chat_access(item)
+                                err = access_error(item)
                                 return error_result(
                                     log_and_format_error(
                                         func.__name__,

@@ -12,7 +12,9 @@ import main
 from telegram_mcp import runtime
 from telegram_mcp.runtime import (
     ALLOWED_CHAT_IDS,
+    CHAT_WRITE_EXEMPT_TOOLS,
     ChatAccessDeniedError,
+    _writes_to_chat,
     _parse_allowed_chat_ids,
     check_chat_access,
     get_effective_allowed_chat_ids,
@@ -713,3 +715,72 @@ async def test_get_folder_hides_unallowed_chats(monkeypatch):
     assert [c["id"] for c in res["included_chats"]] == [101]
     assert res["pinned_chats"] == []
     assert res["excluded_chats"] == []
+
+
+# ==============================================================================
+# 10. TELEGRAM_WRITE_ALLOWED_CHAT_IDS: write targets only
+# ==============================================================================
+
+
+def _stub_send(monkeypatch, entity):
+    async def resolve(chat_id, cl):
+        return entity
+
+    monkeypatch.setattr(messages, "get_client", lambda account=None: FakeAllowlistClient())
+    monkeypatch.setattr(messages, "resolve_entity", resolve)
+
+
+@pytest.mark.asyncio
+async def test_write_allowlist_blocks_sending_outside_it(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WRITE_ALLOWED_CHAT_IDS", "@BotFather,93372553")
+
+    res = await messages.send_message(chat_id=-100999999999, message="hello", account=None)
+    assert "Writing to chat '-100999999999' is restricted by privacy policy" in res
+    assert "TELEGRAM_WRITE_ALLOWED_CHAT_IDS" in res
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id", ["@BotFather", "botfather", 93372553])
+async def test_write_allowlist_lets_listed_chat_through(monkeypatch, chat_id):
+    monkeypatch.setenv("TELEGRAM_WRITE_ALLOWED_CHAT_IDS", "@BotFather,93372553")
+    _stub_send(monkeypatch, SimpleNamespace(id=93372553, username="BotFather"))
+
+    res = await messages.send_message(chat_id=chat_id, message="/start", account=None)
+    assert res.startswith("Message sent successfully")
+
+
+@pytest.mark.asyncio
+async def test_write_allowlist_leaves_reads_alone(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WRITE_ALLOWED_CHAT_IDS", "@BotFather")
+
+    @validate_id("chat_id")
+    async def get_messages(chat_id: Union[int, str], account: Optional[str] = None):
+        return "read"
+
+    assert await get_messages(chat_id=-100999999999) == "read"
+
+
+@pytest.mark.asyncio
+async def test_write_needs_both_allowlists(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-100111111111")
+    monkeypatch.setenv("TELEGRAM_WRITE_ALLOWED_CHAT_IDS", "-100222222222")
+
+    res = await messages.send_message(chat_id=-100222222222, message="hi", account=None)
+    assert "(TELEGRAM_ALLOWED_CHAT_IDS)" in res
+    res = await messages.send_message(chat_id=-100111111111, message="hi", account=None)
+    assert "(TELEGRAM_WRITE_ALLOWED_CHAT_IDS)" in res
+
+
+def test_writes_to_chat_follows_tool_annotations():
+    assert _writes_to_chat("send_message", "chat_id")
+    assert _writes_to_chat("forward_message", "to_chat_id")
+    assert not _writes_to_chat("forward_message", "from_chat_id")
+    assert not _writes_to_chat("get_messages", "chat_id")
+    assert not _writes_to_chat("download_media", "chat_id")
+    assert _writes_to_chat("no_such_tool", "chat_id")
+
+
+def test_write_exempt_tools_are_registered_write_tools():
+    tools = {tool.name: tool for tool in runtime.mcp._tool_manager.list_tools()}
+    for name in CHAT_WRITE_EXEMPT_TOOLS:
+        assert not tools[name].annotations.readOnlyHint, name
